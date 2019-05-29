@@ -96,7 +96,11 @@ extern void mesh_assertion_handler(uint32_t pc);
  * Compile-time assertion.
  * @param[in] cond Condition to evaluate. If @c false, the compilation will be aborted with an error.
  */
+#ifdef NORDIC_BUG_FIXED
 #define NRF_MESH_STATIC_ASSERT(cond) typedef char static_assert[(cond) ? 1 : -1]
+#else
+#define NRF_MESH_STATIC_ASSERT(cond) typedef char unique_static_assert_variable_1234[(cond) ? 1 : -1]
+#endif
 
 /** @} */
 
