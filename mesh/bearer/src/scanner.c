@@ -68,13 +68,15 @@ typedef struct
     uint8_t        channels[SCANNER_CHANNELS_MAX];               /**< Radio channels to be used by the scanner. */
     uint8_t        channel_count;                                /**< Number of radio channels. */
     uint32_t       access_addresses[RADIO_CONFIG_LOGICAL_ADDRS]; /**< Access addresses to be used by the scanner. */
+    uint8_t        scan_type;                                    /**< Set to 1 for active scanning. */
 } scanner_config_t;
 
 typedef enum
 {
     SCANNER_STATE_UNINITIALIZED,
     SCANNER_STATE_IDLE,
-    SCANNER_STATE_RUNNING
+    SCANNER_STATE_RUNNING,
+    SCANNER_STATE_SEND_REQ
 } scanner_state_t;
 
 typedef enum
@@ -109,6 +111,15 @@ typedef struct
 
 static scanner_t m_scanner;
 
+static uint8_t m_tx_buf[] =
+{
+  0xC3,                               // BLE Header (PDU_TYPE: SCAN_REQ, TXadd: 1 (random address), RXadd: 1 (random address)
+  0x0C,                               // Length of payload: 12
+  0x00,                               // Padding bits for S1 (REF: the  nRF51 reference manual 16.1.2)
+  0xDE, 0xDE, 0xDE, 0xDE, 0xDE, 0xDE, // InitAddr LSByte first
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // AdvAddr LSByte first
+};
+
 /*****************************************************************************
 * Static functions
 *****************************************************************************/
@@ -127,10 +138,22 @@ static inline bool continuous_scanning(void)
     return (m_scanner.config.scan_interval_us == m_scanner.config.scan_window_us);
 }
 
+static inline bool active_scanning(void)
+{
+    return (m_scanner.config.scan_type == 1);
+}
+
 /*****************************************************************************
 * Radio operation
 *****************************************************************************/
 
+/**
+ * Assume that there is no pending packet in p_buffer_packet. Then retrieve a slot for a packet from the 
+ * packet_buffer and set the local p_buffer_packet to that slot. If there is no slot available in the packet buffer
+ * the waiting_for_memory flag will be high. If there is a slot available (got_packet should be called got_slot)
+ * retrieve the scanner_packet_t pointer from the larger p_buffer_packet struct. Write this pointer to 
+ * NRF_RADIO->PACKETPTR to be subsequently be filled by the radio when it goes in RX mode.
+ */
 static bool radio_set_packet(void)
 {
     NRF_MESH_ASSERT(m_scanner.p_buffer_packet == NULL);
@@ -152,6 +175,9 @@ static bool radio_set_packet(void)
     return got_packet;
 }
 
+/*
+ * Configure radio. Add short between READY and START and between receiving the ADDRESS and starting RSSI.
+ */
 static void radio_configure(void)
 {
     radio_config_reset();
@@ -208,6 +234,14 @@ static void radio_stop(void)
     mesh_pa_lna_cleanup();
 }
 
+/**
+ * First configure the radio if necessary.
+ * Then, if there is space, set pointers to the right (empty buffer) and set RADIO to RX.
+ * Subsequently, we have to wait till an END event, see the function radio_handle_end_event
+ *
+ * It is important that the radio is in a DISABLED state. If not, an assertion will be raised. Make sure the radio
+ * has been sent an DISABLE event either explicitly or via an END_DISABLE short.
+ */
 static void radio_start(void)
 {
     NRF_MESH_ASSERT(NRF_RADIO->STATE == RADIO_STATE_STATE_Disabled);
@@ -236,10 +270,56 @@ static void radio_start(void)
     m_scanner.window_state = SCAN_WINDOW_STATE_ON;
 }
 
-static void radio_handle_end_event(void)
-{
-    DEBUG_PIN_SCANNER_ON(DEBUG_PIN_SCANNER_END_EVENT);
+/**
+ * Send a scan request after we have received a scannable packet. We are then in SCANNER_STATE_RUNNING mode. If not,
+ * it would be an error to actually end up here. The recently received packet has been written by the radio 
+ * peripheral to p_packet (argument to this function). 
+ *
+ * We do not want to have the radio going to start receiving stuff for a second. This means all calls to 
+ * radio_set_packet have to be ignored. This is not enough. Also calls to radio_start have to be ignored. For
+ * starters radio_start assumes a DISABLED radio. It configures
+ *
+ * TODO: Check if this interferes with the RX process. If the RX process overwrites so now and then a scan request
+ * this is not a problem. As long as the radio state is correct and there are no NRF_MESH_ASSERTs going off.
+ */
+static void radio_send_scan_request(const scanner_packet_t * p_packet) {
+    // only return a scan request when actually scanning
+    if (m_scanner.state != SCANNER_STATE_RUNNING) {
+        // assert
+        return;
+    }
+    // copy address of advertiser to tx buffer 
+    memcpy(&m_tx_buf[9], p_packet->packet.addr, BLE_GAP_ADDR_LEN);
 
+    NRF_RADIO->PACKETPTR = (uint32_t) &m_tx_buf[0];
+
+    NRF_RADIO->EVENTS_DISABLED = 0;
+
+    NRF_RADIO->TASKS_TXEN = 1;
+
+    m_scanner.state = SCANNER_STATE_SEND_REQ;
+}
+
+/**
+ * Best indeed is to just set to RX and not have to cycle through radio_stop() and radio_start().
+ *
+ * TODO: Check if this is working smoothly across all conditions.
+ */
+static void radio_handle_tx_end_event(void)
+{
+    if (m_scanner.state != SCANNER_STATE_SEND_REQ) {
+        // assert 
+        return;
+    }
+    NRF_RADIO->TASKS_RXEN = 1;
+    m_scanner.state = SCANNER_STATE_RUNNING;
+}
+
+/**
+ * A packet has been successfully received and can now be found in the m_scanner.p_buffer_packet->packet.
+ */
+static void radio_handle_rx_end_event(void)
+{
     bool successful_receive = false;
     scanner_packet_t * p_packet = (scanner_packet_t *) m_scanner.p_buffer_packet->packet;
 
@@ -276,6 +356,10 @@ static void radio_handle_end_event(void)
             m_scanner.rx_callback(p_packet, rx_timestamp_ts);
         }
 
+        if (active_scanning() && (p_packet->packet.header.type == BLE_PACKET_TYPE_ADV_DISCOVER_IND)) {
+            radio_send_scan_request(p_packet);
+        }
+
         packet_buffer_commit(&m_scanner.packet_buffer,
                              m_scanner.p_buffer_packet,
                              SCANNER_PACKET_OVERHEAD + p_packet->packet.header.length);
@@ -292,6 +376,23 @@ static void radio_handle_end_event(void)
     DEBUG_PIN_SCANNER_OFF(DEBUG_PIN_SCANNER_END_EVENT);
 }
 
+static void radio_handle_end_event(void)
+{
+    DEBUG_PIN_SCANNER_ON(DEBUG_PIN_SCANNER_END_EVENT);
+
+    if (m_scanner.state == SCANNER_STATE_SEND_REQ) {
+      radio_handle_tx_end_event();
+    } else {
+      radio_handle_rx_end_event();
+    }
+}
+
+/**
+ * Radio disabled event (will be send by the radio peripheral if the radio is actually disabled). When there is a 
+ * short between END and DISABLE, there is no need to send an actual DISABLE event to the radio.
+ * In the case of the scanner the RADIO_SHORTS_END_DISABLE_Msk short is not set, and the radio will not get disabled
+ * after each END event. This means START will be called after an END event.
+ */
 static void radio_state_disabled_handle(void)
 {
     switch (m_scanner.window_state)
@@ -308,6 +409,10 @@ static void radio_state_disabled_handle(void)
     }
 }
 
+/**
+ * The difference between the rx_handle and the rxidle_handle is that ONLY in the RXIDLE state there will be a
+ * TASKS_START event generated.
+ */
 static void radio_state_rxidle_handle(void)
 {
     switch (m_scanner.window_state)
@@ -318,10 +423,18 @@ static void radio_state_rxidle_handle(void)
             radio_start();
             break;
         case SCAN_WINDOW_STATE_ON:
-            if (radio_set_packet())
+            if (m_scanner.state == SCANNER_STATE_SEND_REQ) 
             {
                 NRF_RADIO->TASKS_START = 1;
+                DEBUG_PIN_SCANNER_ON(DEBUG_PIN_SCANNER_RADIO_IN_TX);
+            }
+            else 
+            {
+              if (radio_set_packet())
+              {
+                NRF_RADIO->TASKS_START = 1;
                 DEBUG_PIN_SCANNER_ON(DEBUG_PIN_SCANNER_RADIO_IN_RX);
+              }
             }
             break;
         case SCAN_WINDOW_STATE_OFF:
@@ -352,6 +465,9 @@ static void radio_state_rx_handle(void)
     }
 }
 
+/**
+ * Small finite state machine (combined with the called functions). 
+ */
 static void radio_setup_next_operation(void)
 {
     switch (m_scanner.state)
@@ -420,6 +536,7 @@ void scanner_radio_irq_handler(void)
     if (NRF_RADIO->EVENTS_END)
     {
         DEBUG_PIN_SCANNER_OFF(DEBUG_PIN_SCANNER_RADIO_IN_RX);
+        DEBUG_PIN_SCANNER_OFF(DEBUG_PIN_SCANNER_RADIO_IN_TX);
         NRF_RADIO->EVENTS_END = 0;
         (void) NRF_RADIO->EVENTS_END;
         radio_handle_end_event();
