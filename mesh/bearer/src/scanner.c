@@ -321,6 +321,11 @@ static void radio_handle_tx_end_event(void)
  */
 static void radio_handle_rx_end_event(void)
 {
+    if (m_scanner.state == SCANNER_STATE_SEND_REQ) {
+        // assert
+        return;
+    }
+
     bool successful_receive = false;
     scanner_packet_t * p_packet = (scanner_packet_t *) m_scanner.p_buffer_packet->packet;
 
@@ -446,6 +451,11 @@ static void radio_state_rxidle_handle(void)
     }
 }
 
+static void radio_state_txidle_handle(void)
+{
+  radio_state_rxidle_handle();
+}
+
 static void radio_state_rx_handle(void)
 {
     switch (m_scanner.window_state)
@@ -466,6 +476,11 @@ static void radio_state_rx_handle(void)
     }
 }
 
+static void radio_state_tx_handle(void)
+{
+  radio_state_rx_handle();
+}
+
 /**
  * Small finite state machine (combined with the called functions). 
  */
@@ -477,11 +492,19 @@ static void radio_setup_next_operation(void)
             radio_stop();
             break;
 
+        case SCANNER_STATE_SEND_REQ:
         case SCANNER_STATE_RUNNING:
             switch (NRF_RADIO->STATE)
             {
                 case RADIO_STATE_STATE_Disabled:
                     radio_state_disabled_handle();
+                    break;
+                case RADIO_STATE_STATE_TxIdle:
+                    radio_state_txidle_handle(); 
+                case RADIO_STATE_STATE_Tx:
+                case RADIO_STATE_STATE_TxRu:
+                    radio_state_tx_handle(); 
+                case RADIO_STATE_STATE_TxDisable:
                     break;
                 case RADIO_STATE_STATE_RxIdle:
                     radio_state_rxidle_handle();
