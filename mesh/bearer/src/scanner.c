@@ -55,6 +55,7 @@
 #define SCANNER_TIMER_INDEX_LNA_SETUP   (1)
 #define SCANNER_PPI_CH                  (TS_TIMER_PPI_CH_START + TS_TIMER_INDEX_RADIO)
 #define SCANNER_TIMER_LNA_INTERRUPT_Msk (1UL << (TIMER_INTENSET_COMPARE0_Pos + SCANNER_TIMER_INDEX_LNA_SETUP))
+#define SCANNER_ACTIVE                  (1)
 
 /** Scanner packet overhead (i.e. size of packet if length is 0). */
 #define SCANNER_PACKET_OVERHEAD (offsetof(scanner_packet_t, packet.addr))
@@ -601,6 +602,7 @@ void scanner_init(bearer_event_flag_callback_t packet_process_cb)
     scanner_config_reset();
     m_scanner.config.radio_config.tx_power = RADIO_POWER_NRF_0DBM;
     m_scanner.config.radio_config.payload_maxlen = RADIO_CONFIG_ADV_MAX_PAYLOAD_SIZE;
+    m_scanner.config.scan_type = SCANNER_ACTIVE;
     m_scanner.timer_window_end.cb = scan_window_end;
     m_scanner.timer_window_start.cb = scan_window_start;
     m_scanner.state = SCANNER_STATE_IDLE;
