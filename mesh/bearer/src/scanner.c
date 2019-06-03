@@ -286,33 +286,67 @@ static void radio_start(void)
 static void radio_send_scan_request(const scanner_packet_t * p_packet) {
     // only return a scan request when actually scanning
     if (m_scanner.state != SCANNER_STATE_RUNNING) {
+        __LOG(LOG_SRC_NETWORK, LOG_LEVEL_DBG1, "send_scan_req: %i\n", m_scanner.state);
         // assert
         return;
     }
     // copy address of advertiser to tx buffer 
     memcpy(&m_tx_buf[9], p_packet->packet.addr, BLE_GAP_ADDR_LEN);
+   
+    /*
+    __LOG(LOG_SRC_NETWORK,
+        LOG_LEVEL_DBG1,
+        "SCAN_REQ %x:%x:%x:%x\n",
+        m_tx_buf[9],
+        m_tx_buf[10],
+        m_tx_buf[11],
+        m_tx_buf[12]);
+    */
 
     NRF_RADIO->PACKETPTR = (uint32_t) &m_tx_buf[0];
 
+    // Clear DISABLED event
     NRF_RADIO->EVENTS_DISABLED = 0;
+    NRF_RADIO->EVENTS_END = 0;
+    
+    // Make sure SHORTS are same as in RX
+    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_ADDRESS_RSSISTART_Msk;
 
+    // should subsequently get a REDY event and then a START task need to be set
     NRF_RADIO->TASKS_TXEN = 1;
-
+    
     m_scanner.state = SCANNER_STATE_SEND_REQ;
 }
 
 /**
  * Best indeed is to just set to RX and not have to cycle through radio_stop() and radio_start().
  *
+ * If we set this back to SCANNER_STATE_RUNNING, we 
+ *
  * TODO: Check if this is working smoothly across all conditions.
  */
 static void radio_handle_tx_end_event(void)
 {
     if (m_scanner.state != SCANNER_STATE_SEND_REQ) {
+        __LOG(LOG_SRC_NETWORK, LOG_LEVEL_DBG1, "tx_end_event: %i\n", m_scanner.state);
         // assert 
         return;
     }
+    /*
+    __LOG(LOG_SRC_NETWORK,
+        LOG_LEVEL_DBG1,
+        "SCAN_REQ END %x:%x:%x:%x\n",
+        m_tx_buf[9],
+        m_tx_buf[10],
+        m_tx_buf[11],
+        m_tx_buf[12]);
+    */
+
+    radio_stop();
+    radio_start();
+
     NRF_RADIO->TASKS_RXEN = 1;
+
     m_scanner.state = SCANNER_STATE_RUNNING;
 }
 
@@ -362,19 +396,27 @@ static void radio_handle_rx_end_event(void)
             m_scanner.rx_callback(p_packet, rx_timestamp_ts);
         }
 
-        if (active_scanning() && (p_packet->packet.header.type == BLE_PACKET_TYPE_ADV_DISCOVER_IND)) {
-            radio_send_scan_request(p_packet);
-        }
-
+        if (m_scanner.p_buffer_packet == NULL) {
+          __LOG(LOG_SRC_NETWORK, LOG_LEVEL_DBG1, "Error?\n");;
+        } else {
         packet_buffer_commit(&m_scanner.packet_buffer,
                              m_scanner.p_buffer_packet,
                              SCANNER_PACKET_OVERHEAD + p_packet->packet.header.length);
+        }
+        if (active_scanning() && (p_packet->packet.header.type == BLE_PACKET_TYPE_ADV_DISCOVER_IND)) {
+          // we still want to commit previously obtained packet to buffer
+            radio_send_scan_request(p_packet);
+        }
 
         bearer_event_flag_set(m_scanner.nrf_mesh_process_flag);
     }
     else
     {
-        packet_buffer_free(&m_scanner.packet_buffer, m_scanner.p_buffer_packet);
+        if (m_scanner.p_buffer_packet == NULL) {
+          __LOG(LOG_SRC_NETWORK, LOG_LEVEL_DBG1, "Error 1?\n");;
+        } else {
+          packet_buffer_free(&m_scanner.packet_buffer, m_scanner.p_buffer_packet);
+        }
     }
 
     m_scanner.p_buffer_packet = NULL;
@@ -418,6 +460,8 @@ static void radio_state_disabled_handle(void)
 /**
  * The difference between the rx_handle and the rxidle_handle is that ONLY in the RXIDLE state there will be a
  * TASKS_START event generated.
+ *
+ * TODO: Note, should never end up here... There is a short between READY and START. Nop, does not end up here.
  */
 static void radio_state_rxidle_handle(void)
 {
@@ -453,7 +497,7 @@ static void radio_state_rxidle_handle(void)
 
 static void radio_state_txidle_handle(void)
 {
-  radio_state_rxidle_handle();
+    radio_state_rxidle_handle();
 }
 
 static void radio_state_rx_handle(void)
@@ -476,9 +520,13 @@ static void radio_state_rx_handle(void)
     }
 }
 
+/**
+ * One of the last things it does. Somehow it does not do anything afterwards. Weirdly enough, there was no 
+ * tx idle call. There were only direct rxidle calls. Every time RX has been started.
+ */
 static void radio_state_tx_handle(void)
 {
-  radio_state_rx_handle();
+    radio_state_rx_handle();
 }
 
 /**
@@ -501,9 +549,11 @@ static void radio_setup_next_operation(void)
                     break;
                 case RADIO_STATE_STATE_TxIdle:
                     radio_state_txidle_handle(); 
+                    break;
                 case RADIO_STATE_STATE_Tx:
                 case RADIO_STATE_STATE_TxRu:
                     radio_state_tx_handle(); 
+                    break;
                 case RADIO_STATE_STATE_TxDisable:
                     break;
                 case RADIO_STATE_STATE_RxIdle:
@@ -537,7 +587,7 @@ void scanner_radio_start(ts_timestamp_t start_time)
     m_scanner.is_radio_cfg_pending = false;
     radio_configure();
 
-    if (m_scanner.state == SCANNER_STATE_RUNNING &&
+    if ((m_scanner.state == SCANNER_STATE_RUNNING || m_scanner.state == SCANNER_STATE_SEND_REQ) &&
         m_scanner.window_state != SCAN_WINDOW_STATE_OFF)
     {
         radio_start();
@@ -659,7 +709,7 @@ void scanner_disable(void)
 {
     NRF_MESH_ASSERT(m_scanner.state != SCANNER_STATE_UNINITIALIZED);
 
-    if (m_scanner.state == SCANNER_STATE_RUNNING)
+    if (m_scanner.state == SCANNER_STATE_RUNNING || m_scanner.state == SCANNER_STATE_SEND_REQ)
     {
         timer_sch_abort(&m_scanner.timer_window_end);
         timer_sch_abort(&m_scanner.timer_window_start);
@@ -670,7 +720,7 @@ void scanner_disable(void)
 
 bool scanner_is_enabled(void)
 {
-    return (m_scanner.state == SCANNER_STATE_RUNNING);
+    return (m_scanner.state == SCANNER_STATE_RUNNING || m_scanner.state == SCANNER_STATE_SEND_REQ);
 }
 
 const scanner_packet_t * scanner_rx(void)
@@ -732,7 +782,7 @@ void scanner_config_scan_time_set(uint32_t scan_interval_us, uint32_t scan_windo
     m_scanner.config.scan_window_us = scan_window_us;
     m_scanner.timer_window_end.interval = m_scanner.config.scan_interval_us;
     m_scanner.timer_window_start.interval = m_scanner.config.scan_interval_us;
-    if (m_scanner.state == SCANNER_STATE_RUNNING)
+    if (m_scanner.state == SCANNER_STATE_RUNNING || m_scanner.state == SCANNER_STATE_SEND_REQ)
     {
         schedule_timers();
     }
