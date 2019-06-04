@@ -1,4 +1,4 @@
-/* Copyright (c) 2010 - 2018, Nordic Semiconductor ASA
+/* Copyright (c) 2010 - 2019, Nordic Semiconductor ASA
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification,
@@ -44,6 +44,7 @@
 #include "mesh_pa_lna_internal.h"
 #include "nrf_mesh_config_bearer.h"
 #include "bearer_handler.h"
+#include "advertiser.h"
 
 #ifdef NRF52_SERIES
 #define LNA_SETUP_OVERHEAD_US 1
@@ -51,6 +52,8 @@
 #define LNA_SETUP_OVERHEAD_US 6
 #endif
 
+#define TIFS 150 /**< Bluetooth specification TIFS value in microseconds. */
+#define RADIO_RXTX_CHAIN_DELAY_1M_US 9 /**< Chain delay in microseconds when switching from rx to tx on 1Mbps */
 #define SCANNER_TIMER_INDEX_TIMESTAMP   (TS_TIMER_INDEX_RADIO)
 #define SCANNER_TIMER_INDEX_LNA_SETUP   (1)
 #define SCANNER_PPI_CH                  (TS_TIMER_PPI_CH_START + TS_TIMER_INDEX_RADIO)
@@ -74,7 +77,8 @@ typedef enum
 {
     SCANNER_STATE_UNINITIALIZED,
     SCANNER_STATE_IDLE,
-    SCANNER_STATE_RUNNING
+    SCANNER_STATE_RUNNING,
+    SCANNER_STATE_SCAN_REQ,
 } scanner_state_t;
 
 typedef enum
@@ -101,14 +105,27 @@ typedef struct
     packet_buffer_t          packet_buffer;
     uint8_t                  packet_buffer_data[SCANNER_BUFFER_SIZE];
     scanner_rx_callback_t    rx_callback;
+    ts_timestamp_t           prev_packet_end;
 } scanner_t;
 
+
+/**
+ * BLE standard scan request packet.
+ */
+typedef struct __attribute((packed))
+{
+    ble_packet_hdr_t header;             /**< BLE packet header */
+    uint8_t scan_addr[BLE_GAP_ADDR_LEN]; /**< Scanner's BLE GAP advertisement address */
+    uint8_t adv_addr[BLE_GAP_ADDR_LEN];  /**< Advertiser's BLE GAP advertisement address */
+} scan_req_packet_t;
 /*****************************************************************************
 * Static variables
 *****************************************************************************/
 
 static scanner_t m_scanner;
-
+#if SCANNER_ACTIVE_SCANNING
+static scan_req_packet_t m_scan_req_packet;
+#endif
 /*****************************************************************************
 * Static functions
 *****************************************************************************/
@@ -195,8 +212,6 @@ static void radio_stop(void)
 {
     DEBUG_PIN_SCANNER_OFF(DEBUG_PIN_SCANNER_RADIO_IN_RX);
     NRF_RADIO->TASKS_DISABLE = 1;
-    /* clear any end events, to avoid a misfire */
-    NRF_RADIO->EVENTS_END = 0;
     if (m_scanner.p_buffer_packet != NULL)
     {
         packet_buffer_free(&m_scanner.packet_buffer, m_scanner.p_buffer_packet);
@@ -207,6 +222,27 @@ static void radio_stop(void)
 #endif
     mesh_pa_lna_cleanup();
 }
+
+#if SCANNER_ACTIVE_SCANNING
+static void radio_scan_req(void)
+{
+    NRF_RADIO->SHORTS = RADIO_SHORTS_END_DISABLE_Msk;
+    NRF_RADIO->EVENTS_DISABLED = 0;
+    NRF_RADIO->TASKS_DISABLE = 1;
+    NRF_RADIO->PACKETPTR = (uint32_t) &m_scan_req_packet;
+    NRF_RADIO->TXADDRESS = NRF_RADIO->RXMATCH;
+    while (NRF_RADIO->STATE != RADIO_STATE_STATE_Disabled);
+    NRF_RADIO->TASKS_TXEN = 1;
+
+    /* Set up timer to start radio transmission */
+    NRF_PPI->CHENCLR = (1UL << SCANNER_PPI_CH);
+    NRF_TIMER0->INTENCLR = (1 << SCANNER_TIMER_INDEX_TIMESTAMP);
+    NRF_TIMER0->CC[SCANNER_TIMER_INDEX_TIMESTAMP] = m_scanner.prev_packet_end + TIFS - RADIO_RXTX_CHAIN_DELAY_1M_US;
+    NRF_PPI->CH[SCANNER_PPI_CH].EEP = (uint32_t) &NRF_TIMER0->EVENTS_COMPARE[SCANNER_TIMER_INDEX_TIMESTAMP];
+    NRF_PPI->CH[SCANNER_PPI_CH].TEP = (uint32_t) &NRF_RADIO->TASKS_START;
+    NRF_PPI->CHENSET = (1UL << SCANNER_PPI_CH);
+}
+#endif
 
 static void radio_start(void)
 {
@@ -235,10 +271,15 @@ static void radio_start(void)
     }
     m_scanner.window_state = SCAN_WINDOW_STATE_ON;
 }
+    
+//static int incoming = 0;
 
-static void radio_handle_end_event(void)
+static void radio_handle_rx_end_event(void)
 {
     DEBUG_PIN_SCANNER_ON(DEBUG_PIN_SCANNER_END_EVENT);
+
+//  incoming++;
+//    __LOG(LOG_SRC_NETWORK, LOG_LEVEL_DBG3, "Rx event %x\n", incoming);
 
     bool successful_receive = false;
     scanner_packet_t * p_packet = (scanner_packet_t *) m_scanner.p_buffer_packet->packet;
@@ -276,6 +317,22 @@ static void radio_handle_end_event(void)
             m_scanner.rx_callback(p_packet, rx_timestamp_ts);
         }
 
+#if SCANNER_ACTIVE_SCANNING
+        if ((p_packet->packet.header.type == BLE_PACKET_TYPE_ADV_IND ||
+             p_packet->packet.header.type == BLE_PACKET_TYPE_ADV_DISCOVER_IND) &&
+             p_packet->packet.header.length >= BLE_GAP_ADDR_LEN)
+        {
+            m_scanner.prev_packet_end =
+                rx_timestamp_ts + (p_packet->packet.header.length + BLE_ADV_PACKET_HEADER_LENGTH + RADIO_CONFIG_CRC_LEN) *
+                                      RADIO_TIME_PER_BYTE(RADIO_MODE_BLE_1MBIT);
+
+            memcpy(m_scan_req_packet.adv_addr, p_packet->packet.addr, BLE_GAP_ADDR_LEN);
+            m_scan_req_packet.header._rfu2 = p_packet->packet.header.addr_type;
+
+            m_scanner.state = SCANNER_STATE_SCAN_REQ;
+        }
+#endif
+
         packet_buffer_commit(&m_scanner.packet_buffer,
                              m_scanner.p_buffer_packet,
                              SCANNER_PACKET_OVERHEAD + p_packet->packet.header.length);
@@ -288,6 +345,8 @@ static void radio_handle_end_event(void)
     }
 
     m_scanner.p_buffer_packet = NULL;
+    
+    //incoming--;
 
     DEBUG_PIN_SCANNER_OFF(DEBUG_PIN_SCANNER_END_EVENT);
 }
@@ -378,7 +437,15 @@ static void radio_setup_next_operation(void)
                     NRF_MESH_ASSERT(false);
             }
             break;
-
+#if SCANNER_ACTIVE_SCANNING
+        case SCANNER_STATE_SCAN_REQ:
+            /* Scan requests should only be initiated from the RX idle state, right after a successful receive. */
+            if (NRF_RADIO->STATE == RADIO_STATE_STATE_RxIdle)
+            {
+                radio_scan_req();
+            }
+            break;
+#endif
         case SCANNER_STATE_UNINITIALIZED:
         default:
             NRF_MESH_ASSERT(false);
@@ -393,12 +460,13 @@ void scanner_radio_start(ts_timestamp_t start_time)
 {
     DEBUG_PIN_SCANNER_ON(DEBUG_PIN_SCANNER_START);
     DEBUG_PIN_SCANNER_ON(DEBUG_PIN_SCANNER_IN_ACTION);
+
+    NRF_MESH_ASSERT(m_scanner.state != SCANNER_STATE_SCAN_REQ);
     m_scanner.has_radio_context = true;
     m_scanner.is_radio_cfg_pending = false;
     radio_configure();
 
-    if (m_scanner.state == SCANNER_STATE_RUNNING &&
-        m_scanner.window_state != SCAN_WINDOW_STATE_OFF)
+    if (scanner_is_enabled() && m_scanner.window_state != SCAN_WINDOW_STATE_OFF)
     {
         radio_start();
     }
@@ -409,6 +477,11 @@ void scanner_radio_stop(void)
 {
     DEBUG_PIN_SCANNER_ON(DEBUG_PIN_SCANNER_STOP);
     m_scanner.has_radio_context = false;
+    // Abandon any pending scan requests
+    if (m_scanner.state == SCANNER_STATE_SCAN_REQ)
+    {
+        m_scanner.state = SCANNER_STATE_RUNNING;
+    }
     radio_stop();
     DEBUG_PIN_SCANNER_OFF(DEBUG_PIN_SCANNER_IN_ACTION);
     DEBUG_PIN_SCANNER_OFF(DEBUG_PIN_SCANNER_STOP);
@@ -422,7 +495,17 @@ void scanner_radio_irq_handler(void)
         DEBUG_PIN_SCANNER_OFF(DEBUG_PIN_SCANNER_RADIO_IN_RX);
         NRF_RADIO->EVENTS_END = 0;
         (void) NRF_RADIO->EVENTS_END;
-        radio_handle_end_event();
+
+        if (m_scanner.state == SCANNER_STATE_SCAN_REQ)
+        {
+            m_scanner.state = SCANNER_STATE_RUNNING;
+            while (NRF_RADIO->STATE != RADIO_STATE_STATE_Disabled);
+            radio_configure();
+        }
+        else
+        {
+            radio_handle_rx_end_event();
+        }
     }
 
     radio_setup_next_operation();
@@ -489,6 +572,15 @@ void scanner_init(bearer_event_flag_callback_t packet_process_cb)
     m_scanner.state = SCANNER_STATE_IDLE;
     m_scanner.window_state = SCAN_WINDOW_STATE_ON;
     m_scanner.nrf_mesh_process_flag = bearer_event_flag_add(packet_process_cb);
+
+#if SCANNER_ACTIVE_SCANNING
+    m_scan_req_packet.header.length = 2 * BLE_GAP_ADDR_LEN;
+    m_scan_req_packet.header.type = BLE_PACKET_TYPE_SCAN_REQ;
+    ble_gap_addr_t addr;
+    advertiser_address_default_get(&addr);
+    m_scan_req_packet.header.addr_type = (addr.addr_type == BLE_GAP_ADDR_TYPE_RANDOM_STATIC);
+    memcpy(m_scan_req_packet.scan_addr, addr.addr, BLE_GAP_ADDR_LEN);
+#endif
 }
 
 void scanner_rx_callback_set(scanner_rx_callback_t callback)
@@ -517,7 +609,7 @@ void scanner_disable(void)
 {
     NRF_MESH_ASSERT(m_scanner.state != SCANNER_STATE_UNINITIALIZED);
 
-    if (m_scanner.state == SCANNER_STATE_RUNNING)
+    if (scanner_is_enabled())
     {
         timer_sch_abort(&m_scanner.timer_window_end);
         timer_sch_abort(&m_scanner.timer_window_start);
@@ -528,7 +620,7 @@ void scanner_disable(void)
 
 bool scanner_is_enabled(void)
 {
-    return (m_scanner.state == SCANNER_STATE_RUNNING);
+    return (m_scanner.state == SCANNER_STATE_RUNNING || m_scanner.state == SCANNER_STATE_SCAN_REQ);
 }
 
 const scanner_packet_t * scanner_rx(void)
@@ -590,7 +682,7 @@ void scanner_config_scan_time_set(uint32_t scan_interval_us, uint32_t scan_windo
     m_scanner.config.scan_window_us = scan_window_us;
     m_scanner.timer_window_end.interval = m_scanner.config.scan_interval_us;
     m_scanner.timer_window_start.interval = m_scanner.config.scan_interval_us;
-    if (m_scanner.state == SCANNER_STATE_RUNNING)
+    if (scanner_is_enabled())
     {
         schedule_timers();
     }

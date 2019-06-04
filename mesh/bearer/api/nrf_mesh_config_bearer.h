@@ -1,4 +1,4 @@
-/* Copyright (c) 2010 - 2018, Nordic Semiconductor ASA
+/* Copyright (c) 2010 - 2019, Nordic Semiconductor ASA
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification,
@@ -137,6 +137,11 @@
 /** Number of flags available for allocation. */
 #ifndef BEARER_EVENT_FLAG_COUNT
 #define BEARER_EVENT_FLAG_COUNT     10
+#endif
+
+/** Enable active scanner role */
+#ifndef SCANNER_ACTIVE_SCANNING
+#define SCANNER_ACTIVE_SCANNING 1
 #endif
 
 /** @} end of MESH_CONFIG_BEARER_EVENT */
